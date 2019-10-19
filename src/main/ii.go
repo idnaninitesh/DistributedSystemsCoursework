@@ -42,7 +42,6 @@ func reduceF(key string, values []string) string {
 	uniqueValuesStr := currValue
 	uniqueValuesLen := 1
 
-	fmt.Printf("key : %s\n", key)
 	for i := 1;i < len(values);i++ {
 		if values[i] == currValue {
 			continue

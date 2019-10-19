@@ -1,11 +1,14 @@
 package raftkv
 
 import (
+	"bytes"
 	"labgob"
 	"labrpc"
 	"log"
 	"raft"
 	"sync"
+	"time"
+//	"fmt"
 )
 
 const Debug = 0
@@ -22,6 +25,11 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	ClerkId    int64
+	OperationId int
+	Operation   string
+	Key         string
+	Value       string
 }
 
 type KVServer struct {
@@ -31,17 +39,233 @@ type KVServer struct {
 	applyCh chan raft.ApplyMsg
 
 	maxraftstate int // snapshot if log grows this big
-
+	persister *raft.Persister
 	// Your definitions here.
+
+	kvMap   map[string]string
+	clerkRequestMap map[int64]int
+	logEntryReplyChMap map[int]chan Op
+
+	isAlive bool
+}
+
+//
+// save Raft's persistent state to stable storage,
+// where it can later be retrieved after a crash and restart.
+//
+
+func (kv *KVServer) persist(lastIncludedIndex int) {
+	// Your code here (3B).
+	// Example:
+	// w := new(bytes.Buffer)
+	// e := labgob.NewEncoder(w)
+	// e.Encode(kv.xxx)
+	// e.Encode(kv.yyy)
+	// data := w.Bytes()
+	// kv.persister.SaveRaftState(data)
+
+	kv.mu.Lock()
+
+	currentSize := kv.persister.RaftStateSize()
+	sizeThreshold := int(float64(kv.maxraftstate)*0.85)
+
+	if currentSize < sizeThreshold {
+		kv.mu.Unlock()
+		return
+	}
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.kvMap)
+	e.Encode(kv.clerkRequestMap)
+	data := w.Bytes()
+	kv.mu.Unlock()
+	kv.rf.PersistStateAndSnapshot(data, lastIncludedIndex)
 }
 
 
+//
+// restore previously persisted state.
+//
+func (kv *KVServer) readPersist(data []byte) {
+
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+	// Your code here (3B).
+	// Example:
+	// r := bytes.NewBuffer(data)
+	// d := labgob.NewDecoder(r)
+	// var xxx
+	// var yyy
+	// if d.Decode(&xxx) != nil ||
+	//    d.Decode(&yyy) != nil {
+	//   error...
+	// } else {
+	//   kv.xxx = xxx
+	//   kv.yyy = yyy
+	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var kvMap map[string]string
+	var clerkRequestMap map[int64]int
+
+	if d.Decode(&kvMap) != nil || d.Decode(&clerkRequestMap) != nil {
+		// fmt.Printf("Failed to decode persistent fields\n")
+	} else {
+		kv.mu.Lock()
+		kv.kvMap = kvMap
+		kv.clerkRequestMap = clerkRequestMap
+		kv.mu.Unlock()
+	}
+}
+
+func (kv *KVServer) runMainLoop() {
+
+	for {
+
+		// Exit the routine if server is killed
+		kv.mu.Lock()
+		if kv.isAlive == false {
+			kv.mu.Unlock()
+			return
+		}
+		kv.mu.Unlock()
+
+		// Handle applyCh for the corresponding raft server
+		select {
+		case applyMsg := <-kv.applyCh:
+			kv.mu.Lock()
+
+			if applyMsg.CommandValid == false {
+				kv.mu.Unlock()
+				kv.readPersist(kv.persister.ReadSnapshot())
+			} else {
+
+				operationMsg := applyMsg.Command.(Op)
+				lastOperationId, ok := kv.clerkRequestMap[operationMsg.ClerkId]
+				// Check for duplicate operations
+				if !ok || operationMsg.OperationId > lastOperationId {
+					if operationMsg.Operation == "Get" {
+						// fmt.Printf("Value for key %s is %s\n", operationMsg.Key, kv.kvMap[operationMsg.Key])
+					} else if operationMsg.Operation == "Put" {
+						kv.kvMap[operationMsg.Key] = operationMsg.Value
+						// fmt.Printf("Updated value for key %s is %s\n", operationMsg.Key, kv.kvMap[operationMsg.Key])
+					} else {
+						kv.kvMap[operationMsg.Key] += operationMsg.Value
+						// fmt.Printf("Updated value for key %s is %s\n", operationMsg.Key, kv.kvMap[operationMsg.Key])
+					}
+					kv.clerkRequestMap[operationMsg.ClerkId] = operationMsg.OperationId
+				}
+
+				if kv.maxraftstate != -1 {
+					go kv.persist(applyMsg.CommandIndex)
+				}
+
+				// Send the response on waiting channel
+				logEntryReplyCh, ok := kv.logEntryReplyChMap[applyMsg.CommandIndex]
+				if ok {
+					logEntryReplyCh <- operationMsg
+				}
+				kv.mu.Unlock()
+			}
+		}
+	}
+}
+
+func isSame(op1 Op, op2 Op) bool {
+
+	return op1.ClerkId == op2.ClerkId &&
+		op1.OperationId == op2.OperationId &&
+		op1.Operation == op2.Operation &&
+		op1.Key == op2.Key &&
+		op1.Value == op2.Value
+}
+
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+
+	op := Op{args.ClerkId, args.OperationId, "Get", args.Key, ""}
+	startIndex, startTerm, startLeader := kv.rf.Start(op)
+
+	// Check if server is leader or not
+	if startLeader == false {
+		reply.WrongLeader = true
+		return
+	}
+
+	// Allocate a channel waiting on the raft response
+	kv.mu.Lock()
+	ch := make(chan Op, 1)
+	kv.logEntryReplyChMap[startIndex] = ch
+	kv.mu.Unlock()
+	duration, _ := time.ParseDuration("600ms")
+	waitTimer := time.NewTimer(duration)
+	select {
+	case opReply := <-ch:
+		currentTerm, _ := kv.rf.GetState()
+		// Check if the current server is still a leader
+		if currentTerm == startTerm && isSame(op, opReply) {
+			reply.WrongLeader = false
+			kv.mu.Lock()
+			value, ok := kv.kvMap[opReply.Key]
+			if ok {
+				reply.Value = value
+			} else {
+				reply.Err = ErrNoKey
+			}
+			kv.mu.Unlock()
+		} else {
+			reply.WrongLeader = true
+		}
+		kv.mu.Lock()
+		delete(kv.logEntryReplyChMap, startIndex)
+		kv.mu.Unlock()
+	case <-waitTimer.C:
+		reply.WrongLeader = true
+		kv.mu.Lock()
+		delete(kv.logEntryReplyChMap, startIndex)
+		kv.mu.Unlock()
+	}
+
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+
+	op := Op{args.ClerkId, args.OperationId, args.Op, args.Key, args.Value}
+	startIndex, startTerm, startLeader := kv.rf.Start(op)
+
+	// Check if server is leader or not
+	if startLeader == false {
+		reply.WrongLeader = true
+		return
+	}
+
+	// Allocate a channel waiting on the raft response
+	kv.mu.Lock()
+	ch := make(chan Op, 1)
+	kv.logEntryReplyChMap[startIndex] = ch
+	kv.mu.Unlock()
+	duration, _ := time.ParseDuration("600ms")
+	waitTimer := time.NewTimer(duration)
+	select {
+	case opReply := <-ch:
+		currentTerm, _ := kv.rf.GetState()
+		// Check if the current server is still a leader
+		if currentTerm == startTerm && isSame(op, opReply) {
+			reply.WrongLeader = false
+		} else {
+			reply.WrongLeader = true
+		}
+	case <-waitTimer.C:
+		reply.WrongLeader = true
+	}
+
+	kv.mu.Lock()
+	delete(kv.logEntryReplyChMap, startIndex)
+	kv.mu.Unlock()
+
 }
 
 //
@@ -53,6 +277,10 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
+	kv.mu.Lock()
+	kv.isAlive = false
+	kv.mu.Unlock()
+	// fmt.Printf("Server %d killed\n", kv.me)
 }
 
 //
@@ -80,10 +308,20 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 
+	kv.persister = persister
+
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.kvMap = make(map[string]string)
+	kv.clerkRequestMap = make(map[int64]int)
+	kv.logEntryReplyChMap = make(map[int]chan Op)
+
+	kv.isAlive = true
+
+	kv.readPersist(persister.ReadSnapshot())
 
 	// You may need initialization code here.
+	go kv.runMainLoop()
 
 	return kv
 }

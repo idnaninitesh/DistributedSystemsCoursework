@@ -3,7 +3,6 @@ package mapreduce
 
 import (
         "encoding/json"
-//        "fmt"
         "io/ioutil"
 	"os"
 	"sort"

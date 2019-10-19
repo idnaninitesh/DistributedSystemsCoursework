@@ -2,7 +2,6 @@ package mapreduce
 
 import (
 	"encoding/json"
-	"fmt"
 	"hash/fnv"
 	"io/ioutil"
 	"os"
@@ -61,8 +60,8 @@ func doMap(
 	// Variable initialization
 	var outputKeyValueList []KeyValue
 	var contents []byte
-	//var kvReduceMap map[int][]KeyValue
-	kvReduceMap := make(map[int][]KeyValue)
+	fileHandles := make([]*os.File, nReduce)
+	delim := []byte("\n")
 
 	// Read the input file
 	contents, _ = ioutil.ReadFile(inFile)
@@ -70,30 +69,25 @@ func doMap(
 	// Call the mapF function to get Key-Value pairs
 	outputKeyValueList = mapF(inFile, string(contents))
 
-	// Create a map of reducer number(hash%nReduce) to KeyValue list for efficient insertion
+	// Open nReduce files and get a list of file handles for all files
+	for i := 0;i < nReduce; i++ {
+		fileName := reduceName(jobName, mapTask, i)
+		fileHandles[i], _ = os.OpenFile(fileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		defer fileHandles[i].Close()
+	}
+
+	// Create a hash of key based on reducer number(hash%nReduce) and append to the corresponding file
 	for _, outputKeyValue := range outputKeyValueList {
 		hashInt := ihash(outputKeyValue.Key)%nReduce
-		kvReduceMap[hashInt] = append(kvReduceMap[hashInt], outputKeyValue)
+		b, _ := json.Marshal(outputKeyValue)
+		fileHandles[hashInt].Write(b)
+		fileHandles[hashInt].Write(delim)
 	}
 
-	// Create and write to intermediate files
-	// Create i intermediate file, write all key with hash set to i in the file
-	// Close the i intermediate file
-	for i := 0; i < nReduce; i++ {
-		fileName := reduceName(jobName, mapTask, i)
-		fmt.Println(fileName)
-		currKeyValueList := kvReduceMap[i]
-		f, _ := os.OpenFile(fileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644);
-		defer f.Close()
-		for _, kv := range currKeyValueList {
-			b, _ := json.Marshal(kv)
-			f.Write(b)
-			f.Write([]byte("\n"))
-			// f.Write([]byte(kv.Key + "-" + kv.Value+"\n"))
-		}
-		f.Close()
+	// Close all the intermediate files
+	for i := 0;i < nReduce; i++ {
+		fileHandles[i].Close()
 	}
-
 }
 
 func ihash(s string) int {
