@@ -1,11 +1,11 @@
 package shardmaster
 
-
 import "raft"
 import "labrpc"
 import "sync"
 import "labgob"
-
+import "time"
+import "fmt"
 
 type ShardMaster struct {
 	mu      sync.Mutex
@@ -14,32 +14,321 @@ type ShardMaster struct {
 	applyCh chan raft.ApplyMsg
 
 	// Your data here.
+	clerkRequestMap    map[int64]int
+	logEntryReplyChMap map[int]chan Op
+
+	isAlive bool
 
 	configs []Config // indexed by config num
 }
 
-
 type Op struct {
 	// Your data here.
+	ClerkId       int64
+	OperationId   int
+	OperationType string
+	OperationArg  interface{}
 }
 
+func (sm *ShardMaster) handleJoin(args JoinArgs) Config {
+
+	lastConfig := sm.configs[len(sm.configs)-1]
+	var config Config
+
+	config.Num = lastConfig.Num + 1
+	config.Groups = make(map[int][]string)
+	groupList := make([]int, 0)
+
+	for key, value := range lastConfig.Groups {
+		config.Groups[key] = value
+		groupList = append(groupList, key)
+	}
+
+	for key, value := range args.Servers {
+		config.Groups[key] = value
+		groupList = append(groupList, key)
+	}
+
+	for i, j := 0, 0; i < NShards; i, j = i+1, j+1 {
+		config.Shards[i] = groupList[j%len(groupList)]
+	}
+
+	return config
+}
+
+func (sm *ShardMaster) handleLeave(args LeaveArgs) Config {
+
+	lastConfig := sm.configs[len(sm.configs)-1]
+	var config Config
+
+	config.Num = lastConfig.Num + 1
+	config.Groups = make(map[int][]string)
+	groupList := make([]int, 0)
+
+	for key, value := range lastConfig.Groups {
+		toDelete := false
+		for _, val := range args.GIDs {
+			if key == val {
+				toDelete = true
+				break
+			}
+		}
+		if toDelete == false {
+			config.Groups[key] = value
+			groupList = append(groupList, key)
+		}
+	}
+
+	if len(groupList) == 0 {
+		groupList = append(groupList, 0)
+	}
+
+	for i, j := 0, 0; i < NShards; i, j = i+1, j+1 {
+		config.Shards[i] = groupList[j%len(groupList)]
+	}
+
+	return config
+}
+
+func (sm *ShardMaster) handleMove(args MoveArgs) Config {
+
+	lastConfig := sm.configs[len(sm.configs)-1]
+	var config Config
+
+	config.Num = lastConfig.Num + 1
+	config.Groups = make(map[int][]string)
+
+	for key, value := range lastConfig.Groups {
+		config.Groups[key] = value
+	}
+
+	for i, _ := range lastConfig.Shards {
+		config.Shards[i] = lastConfig.Shards[i]
+	}
+	config.Shards[args.Shard] = args.GID
+
+	return config
+}
+
+func (sm *ShardMaster) runMainLoop() {
+
+	for {
+
+		// Exit the routine if server is killed
+		sm.mu.Lock()
+		if sm.isAlive == false {
+			sm.mu.Unlock()
+			return
+		}
+		sm.mu.Unlock()
+
+		// Handle applyCh for the corresponding raft server
+		select {
+		case applyMsg := <-sm.applyCh:
+			sm.mu.Lock()
+
+			if applyMsg.CommandValid == false {
+				sm.mu.Unlock()
+			} else {
+
+				operationMsg := applyMsg.Command.(Op)
+				lastOperationId, ok := sm.clerkRequestMap[operationMsg.ClerkId]
+				// Check for duplicate operations
+				if !ok || operationMsg.OperationId > lastOperationId {
+					var config Config
+					if operationMsg.OperationType == "Join" {
+						config = sm.handleJoin(operationMsg.OperationArg.(JoinArgs))
+					} else if operationMsg.OperationType == "Leave" {
+						config = sm.handleLeave(operationMsg.OperationArg.(LeaveArgs))
+					} else if operationMsg.OperationType == "Move" {
+						config = sm.handleMove(operationMsg.OperationArg.(MoveArgs))
+					}
+					if operationMsg.OperationType != "Query" {
+						sm.configs = append(sm.configs, config)
+					}
+					sm.clerkRequestMap[operationMsg.ClerkId] = operationMsg.OperationId
+				}
+
+				// Send the response on waiting channel
+				logEntryReplyCh, ok := sm.logEntryReplyChMap[applyMsg.CommandIndex]
+				if ok {
+					logEntryReplyCh <- operationMsg
+				}
+				sm.mu.Unlock()
+			}
+		}
+	}
+}
+
+func isSame(op1 Op, op2 Op) bool {
+
+	return op1.ClerkId == op2.ClerkId &&
+		op1.OperationId == op2.OperationId
+}
 
 func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 	// Your code here.
+
+	op := Op{args.ClerkId, args.OperationId, "Join", *args}
+	startIndex, startTerm, startLeader := sm.rf.Start(op)
+
+	// Check if server is leader or not
+	if startLeader == false {
+		reply.WrongLeader = true
+		return
+	}
+
+	// Allocate a channel waiting on the raft response
+	sm.mu.Lock()
+	ch := make(chan Op, 1)
+	sm.logEntryReplyChMap[startIndex] = ch
+	sm.mu.Unlock()
+	duration, _ := time.ParseDuration("600ms")
+	waitTimer := time.NewTimer(duration)
+	select {
+	case opReply := <-ch:
+		currentTerm, _ := sm.rf.GetState()
+		// Check if the current server is still a leader
+		if currentTerm == startTerm && isSame(op, opReply) {
+			reply.WrongLeader = false
+		} else {
+			reply.WrongLeader = true
+		}
+	case <-waitTimer.C:
+		reply.WrongLeader = true
+	}
+
+	sm.mu.Lock()
+	fmt.Printf("New log entry added %v\n", sm.configs[len(sm.configs)-1])
+	delete(sm.logEntryReplyChMap, startIndex)
+	sm.mu.Unlock()
+
 }
 
 func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 	// Your code here.
+
+	op := Op{args.ClerkId, args.OperationId, "Leave", *args}
+	startIndex, startTerm, startLeader := sm.rf.Start(op)
+
+	// Check if server is leader or not
+	if startLeader == false {
+		reply.WrongLeader = true
+		return
+	}
+
+	// Allocate a channel waiting on the raft response
+	sm.mu.Lock()
+	ch := make(chan Op, 1)
+	sm.logEntryReplyChMap[startIndex] = ch
+	sm.mu.Unlock()
+	duration, _ := time.ParseDuration("600ms")
+	waitTimer := time.NewTimer(duration)
+	select {
+	case opReply := <-ch:
+		currentTerm, _ := sm.rf.GetState()
+		// Check if the current server is still a leader
+		if currentTerm == startTerm && isSame(op, opReply) {
+			reply.WrongLeader = false
+		} else {
+			reply.WrongLeader = true
+		}
+	case <-waitTimer.C:
+		reply.WrongLeader = true
+	}
+
+	sm.mu.Lock()
+	fmt.Printf("New log entry added %v\n", sm.configs[len(sm.configs)-1])
+	delete(sm.logEntryReplyChMap, startIndex)
+	sm.mu.Unlock()
+
 }
 
 func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 	// Your code here.
+
+	op := Op{args.ClerkId, args.OperationId, "Move", *args}
+	startIndex, startTerm, startLeader := sm.rf.Start(op)
+
+	// Check if server is leader or not
+	if startLeader == false {
+		reply.WrongLeader = true
+		return
+	}
+
+	// Allocate a channel waiting on the raft response
+	sm.mu.Lock()
+	ch := make(chan Op, 1)
+	sm.logEntryReplyChMap[startIndex] = ch
+	sm.mu.Unlock()
+	duration, _ := time.ParseDuration("600ms")
+	waitTimer := time.NewTimer(duration)
+	select {
+	case opReply := <-ch:
+		currentTerm, _ := sm.rf.GetState()
+		// Check if the current server is still a leader
+		if currentTerm == startTerm && isSame(op, opReply) {
+			reply.WrongLeader = false
+		} else {
+			reply.WrongLeader = true
+		}
+	case <-waitTimer.C:
+		reply.WrongLeader = true
+	}
+
+
+	sm.mu.Lock()
+	fmt.Printf("New log entry added %v\n", sm.configs[len(sm.configs)-1])
+	delete(sm.logEntryReplyChMap, startIndex)
+	sm.mu.Unlock()
+
 }
 
 func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 	// Your code here.
-}
 
+	op := Op{args.ClerkId, args.OperationId, "Query", args}
+	startIndex, startTerm, startLeader := sm.rf.Start(op)
+
+	// Check if server is leader or not
+	if startLeader == false {
+		reply.WrongLeader = true
+		return
+	}
+
+	// Allocate a channel waiting on the raft response
+	sm.mu.Lock()
+	ch := make(chan Op, 1)
+	sm.logEntryReplyChMap[startIndex] = ch
+	sm.mu.Unlock()
+	duration, _ := time.ParseDuration("600ms")
+	waitTimer := time.NewTimer(duration)
+	select {
+	case opReply := <-ch:
+		currentTerm, _ := sm.rf.GetState()
+		// Check if the current server is still a leader
+		if currentTerm == startTerm && isSame(op, opReply) {
+			reply.WrongLeader = false
+			sm.mu.Lock()
+			lastConfigNum := sm.configs[len(sm.configs)-1].Num
+			if args.Num == -1 || args.Num > lastConfigNum {
+				reply.Config = sm.configs[len(sm.configs)-1]
+			} else {
+				reply.Config = sm.configs[args.Num]
+			}
+			sm.mu.Unlock()
+		} else {
+			reply.WrongLeader = true
+		}
+	case <-waitTimer.C:
+		reply.WrongLeader = true
+	}
+
+	sm.mu.Lock()
+	delete(sm.logEntryReplyChMap, startIndex)
+	sm.mu.Unlock()
+
+}
 
 //
 // the tester calls Kill() when a ShardMaster instance won't
@@ -50,6 +339,9 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 func (sm *ShardMaster) Kill() {
 	sm.rf.Kill()
 	// Your code here, if desired.
+	sm.mu.Lock()
+	sm.isAlive = false
+	sm.mu.Unlock()
 }
 
 // needed by shardkv tester
@@ -68,13 +360,25 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sm.me = me
 
 	sm.configs = make([]Config, 1)
+	sm.configs[0].Num = 0
 	sm.configs[0].Groups = map[int][]string{}
 
 	labgob.Register(Op{})
+	labgob.Register(JoinArgs{})
+	labgob.Register(LeaveArgs{})
+	labgob.Register(MoveArgs{})
+	labgob.Register(QueryArgs{})
 	sm.applyCh = make(chan raft.ApplyMsg)
 	sm.rf = raft.Make(servers, me, persister, sm.applyCh)
 
 	// Your code here.
+	sm.clerkRequestMap = make(map[int64]int)
+	sm.logEntryReplyChMap = make(map[int]chan Op)
+
+	sm.isAlive = true
+
+	// You may need initialization code here.
+	go sm.runMainLoop()
 
 	return sm
 }

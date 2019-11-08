@@ -20,6 +20,8 @@ type Err string
 // Put or Append
 type PutAppendArgs struct {
 	// You'll have to add definitions here.
+	ClerkId      int64
+	OperationId  int
 	Key   string
 	Value string
 	Op    string // "Put" or "Append"
@@ -34,12 +36,26 @@ type PutAppendReply struct {
 }
 
 type GetArgs struct {
-	Key string
 	// You'll have to add definitions here.
+	ClerkId      int64
+	OperationId  int
+	Key string
 }
 
 type GetReply struct {
 	WrongLeader bool
 	Err         Err
 	Value       string
+}
+
+type MigrateArgs struct {
+	Shard       int
+}
+
+type MigrateReply struct {
+	Success           bool
+	Shard             int
+	KVMap             map[string]string
+	ClerkRequestMap   map[int64]int
+
 }

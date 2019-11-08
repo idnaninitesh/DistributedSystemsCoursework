@@ -20,12 +20,11 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	ClerkId    int64
+	ClerkId     int64
 	OperationId int
 	Operation   string
 	Key         string
@@ -39,11 +38,11 @@ type KVServer struct {
 	applyCh chan raft.ApplyMsg
 
 	maxraftstate int // snapshot if log grows this big
-	persister *raft.Persister
+	persister    *raft.Persister
 	// Your definitions here.
 
-	kvMap   map[string]string
-	clerkRequestMap map[int64]int
+	kvMap              map[string]string
+	clerkRequestMap    map[int64]int
 	logEntryReplyChMap map[int]chan Op
 
 	isAlive bool
@@ -67,7 +66,7 @@ func (kv *KVServer) persist(lastIncludedIndex int) {
 	kv.mu.Lock()
 
 	currentSize := kv.persister.RaftStateSize()
-	sizeThreshold := int(float64(kv.maxraftstate)*0.85)
+	sizeThreshold := int(float64(kv.maxraftstate) * 0.85)
 
 	if currentSize < sizeThreshold {
 		kv.mu.Unlock()
@@ -82,7 +81,6 @@ func (kv *KVServer) persist(lastIncludedIndex int) {
 	kv.mu.Unlock()
 	kv.rf.PersistStateAndSnapshot(data, lastIncludedIndex)
 }
-
 
 //
 // restore previously persisted state.
@@ -218,15 +216,13 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		} else {
 			reply.WrongLeader = true
 		}
-		kv.mu.Lock()
-		delete(kv.logEntryReplyChMap, startIndex)
-		kv.mu.Unlock()
 	case <-waitTimer.C:
 		reply.WrongLeader = true
-		kv.mu.Lock()
-		delete(kv.logEntryReplyChMap, startIndex)
-		kv.mu.Unlock()
 	}
+
+	kv.mu.Lock()
+	delete(kv.logEntryReplyChMap, startIndex)
+	kv.mu.Unlock()
 
 }
 

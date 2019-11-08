@@ -4,14 +4,15 @@ import "labrpc"
 import "crypto/rand"
 import "math/big"
 import "time"
+
 // import "fmt"
 
 type Clerk struct {
-	servers       []*labrpc.ClientEnd
+	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
-	leader        int
-	clerkId       int64
-	operationId   int
+	leader      int
+	clerkId     int64
+	operationId int
 }
 
 func nrand() int64 {
@@ -27,7 +28,6 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	// You'll have to add code here.
 	ck.leader = 0
 	ck.clerkId = nrand()
-	// fmt.Printf("Generated new clerk with clerk id %d\n", ck.clerkId)
 	ck.operationId = 1
 
 	return ck
@@ -56,12 +56,12 @@ func (ck *Clerk) Get(key string) string {
 
 	duration, _ := time.ParseDuration("50ms")
 	for {
-		for i, _ := range(ck.servers) {
+		for i, _ := range ck.servers {
 			var reply GetReply
 			ok := ck.servers[(i+leader)%serversLen].Call("KVServer.Get", &args, &reply)
 			if ok {
 				if reply.WrongLeader == false {
-					ck.leader = (i+leader)%serversLen
+					ck.leader = (i + leader) % serversLen
 					if reply.Err == ErrNoKey {
 						reply.Value = ""
 					}
@@ -94,12 +94,12 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 	duration, _ := time.ParseDuration("50ms")
 	for {
-		for i, _ := range(ck.servers) {
+		for i, _ := range ck.servers {
 			var reply PutAppendReply
 			ok := ck.servers[(i+leader)%serversLen].Call("KVServer.PutAppend", &args, &reply)
 			if ok {
 				if reply.WrongLeader == false {
-					ck.leader = (i+leader)%serversLen
+					ck.leader = (i + leader) % serversLen
 					return
 				}
 			}
