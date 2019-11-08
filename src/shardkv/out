@@ -1,0 +1,24 @@
+Test: static shards ...
+New log entry added {1 [100 100 100 100 100 100 100 100 100 100] map[100:[server-100-0 server-100-1 server-100-2]]}
+New log entry added {2 [100 101 100 101 100 101 100 101 100 101] map[100:[server-100-0 server-100-1 server-100-2] 101:[server-101-0 server-101-1 server-101-2]]}
+101 asked for shard 1 from 100
+101 asked for shard 5 from 100
+101 asked for shard 3 from 100
+101 asked for shard 5 from 100
+101 asked for shard 9 from 100
+100 1 is sending shard 5 0
+101 asked for shard 9 from 100
+101 received shard 5 from 100
+101 asked for shard 5 from 100
+100 1 is sending shard 9 0
+101 received shard 9 from 100
+101 asked for shard 9 from 100
+101 asked for shard 1 from 100
+100 1 is sending shard 1 0
+101 received shard 1 from 100
+101 asked for shard 1 from 100
+101 asked for shard 7 from 100
+101 asked for shard 3 from 100
+101 asked for shard 7 from 100
+signal: interrupt
+FAIL	shardkv	8.598s

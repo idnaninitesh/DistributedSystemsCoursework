@@ -50,6 +50,7 @@ type GetReply struct {
 
 type MigrateArgs struct {
 	Shard       int
+	ConfigNum   int
 }
 
 type MigrateReply struct {

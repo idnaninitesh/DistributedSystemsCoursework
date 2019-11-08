@@ -1,6 +1,5 @@
 package shardkv
 
-
 import "shardmaster"
 import "labrpc"
 import "raft"
@@ -120,10 +119,11 @@ func (kv *KVServer) readPersist(data []byte) {
 
 func (kv *ShardKV) GetShardData(args *MigrateArgs, reply *MigrateReply) {
 
-
 	_, isLeader := kv.rf.GetState()
-	// fmt.Printf("%d is sending shard %d leader %v\n", kv.gid, args.Shard, isLeader)
-	if isLeader == false {
+	kv.mu.Lock()
+	lastConfigNum := kv.lastConfig.Num
+	kv.mu.Unlock()
+	if isLeader == false || lastConfigNum != args.ConfigNum {
 		reply.Success = false
 		return
 	}
@@ -146,32 +146,41 @@ func (kv *ShardKV) GetShardData(args *MigrateArgs, reply *MigrateReply) {
 	reply.Shard = args.Shard
 	reply.Success = true
 
+	fmt.Printf("%d %d is sending shard %d %d\n", kv.gid, kv.me, args.Shard, len(reply.KVMap))
 	kv.mu.Unlock()
+	// fmt.Printf("Adding entry %v by %d %d\n", *args, kv.gid, kv.me)
 	kv.rf.Start(*args)
 
 }
 
-func (kv *ShardKV) handleIncomingShards(incomingShards map[int]int, groups map[int][]string) {
+func (kv *ShardKV) handleIncomingShards(incomingShards map[int]int, groups map[int][]string, configNum int) {
 
 	for s, g := range incomingShards {
 		go func(shard, gid int) {
 			if servers, ok := groups[gid]; ok {
 				args := MigrateArgs{}
 				args.Shard = shard
+				args.ConfigNum = configNum
 				// try each server for the shard.
 				// fmt.Printf("%d asked for shard %d from %d\n", kv.gid, args.Shard, gid)
-				for si := 0; si < len(servers); si++ {
-					kv.mu.Lock()
-					srv := kv.make_end(servers[si])
-					kv.mu.Unlock()
-					var reply MigrateReply
-					// fmt.Printf("%d asked for shard %d from %d\n", kv.gid, args.Shard, gid)
-					ok := srv.Call("ShardKV.GetShardData", &args, &reply)
-					if ok && reply.Success == true {
-						// fmt.Printf("%d received shard %d from %d\n", kv.gid, reply.Shard, gid)
-						kv.rf.Start(reply)
-						break
+				shardFound := false
+				duration, _ := time.ParseDuration("50ms")
+				for shardFound == false {
+					for si := 0; si < len(servers); si++ {
+						// kv.mu.Lock()
+						srv := kv.make_end(servers[si])
+						// kv.mu.Unlock()
+						var reply MigrateReply
+						fmt.Printf("%d asked for shard %d from %d\n", kv.gid, args.Shard, gid)
+						ok := srv.Call("ShardKV.GetShardData", &args, &reply)
+						if ok && reply.Success == true {
+							fmt.Printf("%d received shard %d from %d\n", kv.gid, reply.Shard, gid)
+							// fmt.Printf("Adding entry %v by %d %d\n", reply, kv.gid, kv.me)
+							shardFound = true
+							kv.rf.Start(reply)
+						}
 					}
+					time.Sleep(duration)
 				}
 			}
 		}(s, g)
@@ -181,7 +190,7 @@ func (kv *ShardKV) handleIncomingShards(incomingShards map[int]int, groups map[i
 
 func (kv *ShardKV) runPollMaster() {
 
-	duration, _ := time.ParseDuration("100ms")
+	duration, _ := time.ParseDuration("50ms")
 	for {
 		_, isLeader := kv.rf.GetState()
 		kv.mu.Lock()
@@ -193,64 +202,10 @@ func (kv *ShardKV) runPollMaster() {
 
 			kv.mu.Lock()
 			lastConfigNum := kv.lastConfig.Num+1
-			newConfig := kv.masterClerk.Query(lastConfigNum)
 			kv.mu.Unlock()
+			newConfig := kv.masterClerk.Query(lastConfigNum)
 			if newConfig.Num == lastConfigNum {
-
 				kv.rf.Start(newConfig)
-				kv.mu.Lock()
-
-				// fmt.Printf("New entry added at %d for %d %d - %v\n", lastConfigNum, kv.gid, kv.me, newConfig)
-
-				oldConfig := kv.lastConfig
-				oldHandleShards := kv.handleShards
-
-				newHandleShards := make(map[int]bool)
-
-				for i, _ := range newConfig.Shards {
-					if newConfig.Shards[i] == kv.gid {
-						newHandleShards[i] = true
-					}
-				}
-
-				if len(oldConfig.Groups) != 0 {
-
-					incomingShards := make(map[int]int)
-					// outgoingShards := make(map[int]int)
-
-					// incoming shards - shards in newHandleShards and not in oldHandleShards
-					// count := 0
-					for key, _  := range newHandleShards {
-						_, ok := oldHandleShards[key]
-						if !ok {
-							// count++
-							incomingShards[key] = oldConfig.Shards[key]
-						}
-					}
-					// kv.incomingShardCount = count
-					kv.incomingShardCount = len(incomingShards)
-					kv.handleIncomingShards(incomingShards, oldConfig.Groups)
-
-					// outgoing shards - shard in oldHandleShards and not in newHandleShards
-					// assign the new group id as value for outgoing shards
-					count := 0
-					for key, _ := range oldHandleShards {
-						_, ok := newHandleShards[key]
-						if !ok {
-							count++
-							// outgoingShards[key] = newConfig.Shards[key]
-						}
-					}
-
-					kv.outgoingShardCount = count
-					fmt.Printf("In - %d Out - %d for %d\n", kv.incomingShardCount, kv.outgoingShardCount, kv.gid)
-					// kv.outgoingShardCount = len(outgoingShards)
-					// kv.handleOutgoingShards(outgoingShards, newConfig.Groups)
-				} else {
-					kv.handleShards = newHandleShards
-					kv.lastConfig = newConfig
-				}
-				kv.mu.Unlock()
 			}
 		}
 		time.Sleep(duration)
@@ -275,45 +230,86 @@ func (kv *ShardKV) runMainLoop() {
 			if applyMsg.CommandValid == false {
 				// kv.readPersist(kv.persister.ReadSnapshot())
 			} else {
-				// fmt.Printf("Applying message : %v\n", applyMsg.Command)
+				// fmt.Printf("Applying message : %v %d %d\n", applyMsg.Command, kv.gid, kv.me)
 				switch msg := applyMsg.Command.(type) {
 				case shardmaster.Config:
+					_, isLeader := kv.rf.GetState()
 					kv.mu.Lock()
 
+					// fmt.Printf("New entry added at %d for %d %d - %v\n", lastConfigNum, kv.gid, kv.me, newConfig)
+					newConfig := msg
 					newHandleShards := make(map[int]bool)
 
-					for i, _ := range msg.Shards {
-						if msg.Shards[i] == kv.gid {
+					for i, _ := range newConfig.Shards {
+						if newConfig.Shards[i] == kv.gid {
 							newHandleShards[i] = true
 						}
 					}
-					kv.lastConfig = msg
+
+					oldConfig := kv.lastConfig
+					oldHandleShards := kv.handleShards
+
+					if isLeader == true {
+						if len(oldConfig.Groups) != 0 {
+
+							incomingShards := make(map[int]int)
+							// outgoingShards := make(map[int]int)
+
+							// incoming shards - shards in newHandleShards and not in oldHandleShards
+							// count := 0
+							for key, _  := range newHandleShards {
+								_, ok := oldHandleShards[key]
+								if !ok {
+									// count++
+									incomingShards[key] = oldConfig.Shards[key]
+								}
+							}
+							// kv.incomingShardCount = count
+							kv.incomingShardCount = len(incomingShards)
+							kv.handleIncomingShards(incomingShards, oldConfig.Groups, newConfig.Num)
+
+							// outgoing shards - shard in oldHandleShards and not in newHandleShards
+							count := 0
+							for key, _ := range oldHandleShards {
+								_, ok := newHandleShards[key]
+								if !ok {
+									count++
+									// outgoingShards[key] = newConfig.Shards[key]
+								}
+							}
+
+							kv.outgoingShardCount += count
+							// fmt.Printf("In - %d Out - %d for %d\n", kv.incomingShardCount, kv.outgoingShardCount, kv.gid)
+							// kv.outgoingShardCount = len(outgoingShards)
+							// kv.handleOutgoingShards(outgoingShards, newConfig.Groups)
+						}
+					}
+
 					kv.handleShards = newHandleShards
+					kv.lastConfig = newConfig
 					kv.mu.Unlock()
+
 				case MigrateArgs:
-					fmt.Printf("Applying message : %v group %d id %d\n", applyMsg.Command, kv.gid, kv.me)
 					_, isLeader := kv.rf.GetState()
-					fmt.Printf("Applying message : %v leader %v group %d id %d\n", applyMsg.Command, isLeader, kv.gid, kv.me)
 					kv.mu.Lock()
 					delete(kv.kvMap, msg.Shard)
 					delete(kv.clerkRequestMap, msg.Shard)
 					if isLeader == true {
-						// fmt.Printf("Shard %d deleted by %d\n", msg.Shard, kv.gid)
+						fmt.Printf("Shard %d deleted by %d\n", msg.Shard, kv.gid)
 						kv.outgoingShardCount--
-						// fmt.Printf("In - %d Out - %d for %d\n", kv.incomingShardCount, kv.outgoingShardCount, kv.gid)
+						fmt.Printf("In - %d Out - %d for %d\n", kv.incomingShardCount, kv.outgoingShardCount, kv.gid)
 					}
 					kv.mu.Unlock()
 				case MigrateReply:
-					fmt.Printf("Applying message : %v group %d id %d\n", applyMsg.Command, kv.gid, kv.me)
 					_, isLeader := kv.rf.GetState()
-					fmt.Printf("Applying message : %v leader %v group %d id %d\n", applyMsg.Command, isLeader, kv.gid, kv.me)
 					kv.mu.Lock()
+					// fmt.Printf("\t\t\t\t\tApplying entry %v by %d %d\n", msg, kv.gid, kv.me)
 					kv.kvMap[msg.Shard] = msg.KVMap
 					kv.clerkRequestMap[msg.Shard] = msg.ClerkRequestMap
 					if isLeader == true {
-						// fmt.Printf("Shard %v added by %d\n", msg, kv.gid)
+						fmt.Printf("Shard %v added by %d\n", msg, kv.gid)
 						kv.incomingShardCount--
-						// fmt.Printf("In - %d Out - %d for %d\n", kv.incomingShardCount, kv.outgoingShardCount, kv.gid)
+						fmt.Printf("In - %d Out - %d for %d\n", kv.incomingShardCount, kv.outgoingShardCount, kv.gid)
 					}
 					kv.mu.Unlock()
 				case Op:
